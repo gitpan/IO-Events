@@ -24,13 +24,13 @@
 #  SUCH DAMAGE.
 #
 
-# $Id: Events.pm,v 1.4 2004/07/07 15:35:20 dk Exp $
+# $Id: Events.pm,v 1.11 2004/10/03 20:18:37 dk Exp $
 
 use strict;
 
 package IO::Events;
 use vars qw($VERSION $FORK_MODE @loops);
-$VERSION=0.3;
+$VERSION=0.4;
 
 # Master loop object
 package IO::Events::Loop;
@@ -148,25 +148,27 @@ WAITPID:
    if ( $self-> {waitpid}) {
       while (($_ = waitpid(-1,WNOHANG)) > 0) {
 	 next unless $self->{processes}->{$_};
-	 my $task = $self-> {ids}-> {$self->{processes}-> {$_}};
+	 my @tasks = map { $self-> {ids}-> {$_}} @{$self->{processes}-> {$_}};
 	 # read leftovers
-	 if ( $task-> can_read && $task-> {read} > 0) {
-	    my $notify;
-	    while ( 1) {
-	       my $nbytes = sysread( $task->{handle}, $task->{read_buffer}, 65536, length ($task->{read_buffer}));
-	       unless ( defined $nbytes) {
-		  $self-> error( $task, 'read') unless $! == EAGAIN;
-		  last;
+	 for my $task ( @tasks) {
+	    if ( $task-> can_read && $task-> {read} > 0) {
+	       my $notify;
+	       while ( 1) {
+	          my $nbytes = sysread( $task->{handle}, $task->{read_buffer}, 65536, length ($task->{read_buffer}));
+	          unless ( defined $nbytes) {
+	             $self-> error( $task, 'read') unless $! == EAGAIN;
+	             last;
+	          }
+	          $notify += $nbytes;
+	          last unless $nbytes;
 	       }
-	       $notify += $nbytes;
-	       last unless $nbytes;
+               $task-> notify('on_read') if $notify;
 	    }
-            $task-> notify('on_read') if $notify;
+	    # XXX if $task-> can_exception ... read URG bytes?
+	    $task->{exitcode} = $?;
+	    $task->{finished} = 1;
+	    $task-> destroy;
 	 }
-	 # XXX if $task-> can_exception ... read URG bytes?
-	 $task->{exitcode} = $?;
-	 $task->{finished} = 1;
-	 $task-> destroy;
       }
    }
 
@@ -280,7 +282,7 @@ sub new
       vec( $owner-> {exc}, $fno, 1) = 1;
    }
    $owner-> {filenos}-> {$fno} = $self-> {id};
-   $owner-> {processes}-> {$self->{pid}} = $self-> {id} if defined $self->{pid};
+   push @{$owner-> {processes}-> {$self->{pid}}}, $self-> {id} if defined $self->{pid};
    $owner-> {ids}-> {$self->{id}} = $self;
    $self-> notify('on_create');
    return $self;
@@ -323,7 +325,11 @@ sub DESTROY
 	 vec( $self-> {owner}-> {read}, $self->{fileno}, 1) = 0;
 	 delete $self-> {owner}-> {filenos}-> {$self->{fileno}};
       }
-      delete $self-> {owner}-> {processes}-> {$self->{pid}} if defined $self->{pid};
+      if (defined $self->{pid}) {
+         my $p = $self-> {owner}-> {processes}-> {$self->{pid}};
+	 @$p = grep { $_ ne $self->{id}} @$p;
+         delete $self-> {owner}-> {processes}-> {$self->{pid}} unless @$p;
+      }
       delete $self-> {owner}-> {ids}-> {$self->{id}};
    }
    delete $self->{id};
@@ -389,6 +395,7 @@ sub notify
 sub on_error
 {
    my ( $self, $condition, $errno) = @_;
+   $condition .= " # $self->{fileno}" if $self && defined $self->{fileno};
    warn "Error on $condition: $errno\n";
    $_[0]-> destroy;
 }
@@ -454,6 +461,7 @@ sub new
    die("Cannot fork:$!") unless defined $pid;
    unless ( $pid) {
       # $profile{owner}->on_fork();
+      $|=1;
       my $on_fork = $profile{on_fork} || $self->can('on_fork');
       $on_fork->(\%profile) if $on_fork;
       POSIX::_exit(0);
@@ -546,6 +554,7 @@ sub new
       open STDIN,  "<&READER";
 
       # $profile{owner}->on_fork();
+      $|=1;
       my $on_fork = $profile{on_fork} || $self->can('on_fork');
       $on_fork->(\%profile) if $on_fork;
       POSIX::_exit(0);
@@ -582,25 +591,22 @@ sub shadow_write
 
 sub shadow_close
 {
-   shift-> {shadow_task}-> notify('on_close', 1);
+   my $shadow = shift;
+   $shadow-> {shadow_task}->{finished} = $shadow-> {finished};
+   $shadow-> {shadow_task}->{exitcode} = $shadow-> {exitcode};
+   $shadow-> {shadow_task}-> notify('on_close', 1);
 }
 
 sub shutdown
 {
    my ( $self, @cmd) = @_;
-   my $pid = $self-> {pid};
-   my $owner = $self-> {owner};
-   my $entry;
    for ( @cmd) {
       if ( $_ eq 'read') {
-	 $entry = $self-> {shadow}-> {id};
          $self-> SUPER::DESTROY;
       } elsif ( $_ eq 'write') {
-	 $entry = $self-> {id};
          $self-> {shadow}-> DESTROY if $self-> {shadow};
       }
    }
-   $owner-> {processes}-> {$pid} = $entry if defined $entry;
 }
 
 sub DESTROY
@@ -624,7 +630,7 @@ use vars qw(@ISA);
 
 sub on_fork
 {
-   exec( $_[0]->{process}) or POSIX::_exit(0);
+   exec( $_[0]->{process}) or POSIX::_exit(127);
 }
 
 package IO::Events::stdin;
@@ -1007,9 +1013,10 @@ to stderr and destroys the handle.
 
 Called before object instance is destroyed. 
 
-In a special case for ReadWrite objects, C<on_close> can be called twice,
-when either read or write handles are destroyed. In the latter case the
-second parameter is set to 1.
+In a special case for ReadWrite objects, C<on_close> is called twice,
+when read and write handles are closed. To distinuish between the cases,
+the second parameter is set to 1 when C<on_close> is called due to 
+the writer handle destruction.
 
 Declared as MULTIPLE.
 

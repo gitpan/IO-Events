@@ -2,3 +2,4 @@ Events.pm
 MANIFEST
 Makefile.PL
 test.pl
+META.yml                                 Module meta-data (added by MakeMaker)
