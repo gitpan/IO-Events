@@ -1,9 +1,36 @@
-# $Id: Event.pm,v 1.21 2004/03/16 15:48:38 dk Exp $
+#
+#  Copyright (c) 2004 catpipe Systems ApS
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#  1. Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#  2. Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the distribution.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+#  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+#  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+#  ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+#  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+#  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+#  OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+#  HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+#  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+#  OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+#  SUCH DAMAGE.
+#
+
+# $Id: Events.pm,v 1.4 2004/07/07 15:35:20 dk Exp $
+
 use strict;
 
 package IO::Events;
 use vars qw($VERSION $FORK_MODE @loops);
-$VERSION=0.2;
+$VERSION=0.3;
 
 # Master loop object
 package IO::Events::Loop;
@@ -70,11 +97,16 @@ sub yield
 	 next;
       }
       if ( $r) {
-         my $nbytes = sysread( $task->{handle}, $task->{read_buffer}, 65536, length ($task->{read_buffer}));
-         print STDERR "IO::Events: # $i read $nbytes bytes\n" if $self->{debug};
-	 unless ( defined $nbytes) {
-	    $self-> error( $task, 'read') unless $! == EAGAIN;
-	    next;
+	 my $nbytes = sysread( $task->{handle}, $task->{read_buffer}, 65536, length ($task->{read_buffer}));
+         if ( $task->{read} > 0) {
+	    print STDERR "IO::Events: # $i read $nbytes bytes\n" if $self->{debug};
+	    unless ( defined $nbytes) {
+	       $self-> error( $task, 'read') unless $! == EAGAIN;
+	       next;
+	    }
+	 } else {
+	    $nbytes = 1 unless defined $nbytes; # simulate read
+	    print STDERR "IO::Events: # $i simulated read $nbytes\n" if $self->{debug};
 	 }
 	 if ( $nbytes > 0) {
 	    $task-> notify('on_read');
@@ -118,7 +150,7 @@ WAITPID:
 	 next unless $self->{processes}->{$_};
 	 my $task = $self-> {ids}-> {$self->{processes}-> {$_}};
 	 # read leftovers
-	 if ( $task-> can_read) {
+	 if ( $task-> can_read && $task-> {read} > 0) {
 	    my $notify;
 	    while ( 1) {
 	       my $nbytes = sysread( $task->{handle}, $task->{read_buffer}, 65536, length ($task->{read_buffer}));
@@ -280,6 +312,7 @@ sub DESTROY
    my $self = $_[0];
    return if $self->{dead};
    $self->{dead} = 1;
+   $self-> flush;
    $self-> notify('on_close');
    $self-> {handle}-> close
       if defined $self->{handle} && $self->{auto_close};
@@ -318,9 +351,24 @@ sub write
    my $nbytes = syswrite( $self->{handle}, $self->{write_buffer});
    unless ( defined $nbytes) {
       $self-> {owner}-> error( $self, 'write') if $self->{owner} && $! != EAGAIN;
+      $nbytes = 0 if $! == EAGAIN;
    } elsif ( $nbytes > 0) {
       substr( $self->{write_buffer}, 0, $nbytes) = '';
-  }
+   }
+   $nbytes;
+}
+
+sub flush
+{
+   my ( $self, $discard) = @_;
+   if ( $discard) {
+      $self-> {write_buffer} = '';
+   } else {
+      while ( length $self-> {write_buffer}) {
+	 return undef unless defined $self-> write('');
+      }	 
+   }
+   return 1;
 }
 
 sub destroy { shift-> DESTROY }
@@ -644,16 +692,53 @@ sub new
       fcntl( $profile{handle}, F_SETFL, $fl|O_NONBLOCK) or die "$!";
    }
 
-   if ( $profile{connect}) {
+   if ( defined $profile{connect}) {
       my $iaddr;
-      die "Cannot resolve host\n" unless
-         $iaddr = inet_aton( $profile{host});
+      die "Cannot resolve host '$profile{connect}'\n" unless
+         $iaddr = inet_aton( $profile{connect});
       my $ok = connect( $profile{handle}, sockaddr_in( $profile{port}, $iaddr));
       $ok = 1 if !$ok and ( $! == EWOULDBLOCK || $! == EINPROGRESS);
       die "Connect error: $!" unless $ok;
+   } elsif ( $profile{listen}) {
+      socket( $profile{handle}, PF_INET, SOCK_STREAM, $tcp_protocol) or
+         die( "Error creating socket: $!");
+      setsockopt( $profile{handle}, SOL_SOCKET, SO_REUSEADDR, pack("l", 1)) or 
+         die "Error in setsockopt(SOL_SOCKET,SO_REUSEADDR,1):$!\n";
+      bind( $profile{handle}, sockaddr_in( $profile{port}, INADDR_ANY)) or 
+         die "Error in bind($profile{port}, INADDR_ANY):$!\n";
+      listen( $profile{handle}, SOMAXCONN);
    }
-   
+  
    return $self-> SUPER::new(%profile);
+}
+
+sub accept
+{
+   my ( $self, $generic) = @_;
+   my $old = $self-> {fileno};
+   my $res = accept( $self->{handle}, $generic);
+   return $res unless $res;
+   my $new = fileno( $self->{handle});
+   if ( $old != $new) {
+      my $owner = $self->{owner};
+      if ($self-> {write}) {
+         vec( $owner-> {write}, $old, 1) = 0;
+         vec( $owner-> {write}, $new, 1) = 1;
+      }
+      if ($self-> {read}) {
+         vec( $owner-> {read}, $old, 1) = 0;
+         vec( $owner-> {read}, $new, 1) = 1;
+      }
+      if ($self-> {exception}) {
+         vec( $owner-> {exc}, $old, 1) = 0;
+         vec( $owner-> {exc}, $new, 1) = 1;
+      }
+      my $filenos = $owner-> {filenos};
+      $filenos-> {$new} = $filenos-> {$old};
+      delete $filenos->{$old};
+      $self-> {fileno} = $new;
+   }
+   return $res;
 }
 
 1;
@@ -813,6 +898,12 @@ If set to 1, IO handle is explicitly closed as the object instance is destroyed.
 Doesn't affect anything otherwise.
 
 Default value: 1
+
+=item flush [ DISCARD = 0]
+
+Flushes not yet written data. If DISCARD is 1, does not
+return until all data are written or error is signalled. 
+If 0, discards all data.
 
 =item handle IOHANDLE
 
@@ -1005,11 +1096,43 @@ Shortcut class for STDOUT handle.
 
 Shortcut class for STDERR handle.
 
+=head1 IO::Events::Socket::TCP
+
+Shortcut class for TCP socket. Parameters accepted:
+
+=over
+
+=item connect HOSTNAME
+
+If set, C<connect()> call is issued on the socket to
+HOSTNAME and port set in C<port>
+parameter.
+
+=item listen
+
+If set, socket listens on C<port>.
+
+=item port INTEGER
+
+Number of a port to bind to.
+
+=back
+
+=over
+
+=item accept GENERIC
+
+Accepts connection from GENERIC socket.
+
+=back
+
 =head1 SEE ALSO
 
 L<perlipc>, L<IO::Handle>, L<IO::Select>, L<IPC::Open2>.
 
 =head1 COPYRIGHT
+
+Copyright (c) 2004 catpipe Systems ApS. All rights reserved.
 
 This library is free software; you can redistribute it and/or modify it
 under the same terms as Perl itself.
