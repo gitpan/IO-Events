@@ -1,8 +1,9 @@
+# $Id: Event.pm,v 1.21 2004/03/16 15:48:38 dk Exp $
 use strict;
 
 package IO::Events;
-use vars qw($VERSION);
-$VERSION=0.1;
+use vars qw($VERSION $FORK_MODE @loops);
+$VERSION=0.2;
 
 # Master loop object
 package IO::Events::Loop;
@@ -10,12 +11,12 @@ use vars qw(@ISA);
 
 use IO::Handle;
 use Errno qw(EAGAIN);
-use POSIX ":sys_wait_h";
+use POSIX qw(sys_wait_h exit);
 
 sub new
 {
    my $class = shift;
-   return bless {
+   my $obj = bless {
      # options
      debug     => 0,
      timeout   => 50, # seconds
@@ -30,6 +31,8 @@ sub new
      filenos   => {},
      ids       => {},
    }, $class;
+   push @IO::Events::loops, $obj;
+   return $obj;
 }
 
 sub yield
@@ -44,14 +47,13 @@ sub yield
    my $n = select( $ir, $iw, $ie, exists $profile{timeout} ? $profile{timeout} : $self->{timeout});
    unless ( $n > 0) {
       if ( $self->{debug}) {
-         if ( $n == 0) {
-            print STDERR "IO::Events: empty select\n";
-         } else {
-            print STDERR "IO::Events: select error:$!\n";
-         }
-      } 
-      $self-> error( undef, 'select') if $n < 0;
-      return;
+         print STDERR "IO::Events: empty select";
+	 if ( $n < 0) {
+	     print STDERR " error:$!";
+	 }
+	 print STDERR "\n";
+      }
+      goto WAITPID;
    }
 
    my $i;
@@ -68,8 +70,8 @@ sub yield
 	 next;
       }
       if ( $r) {
-         print STDERR "IO::Events: read $i\n" if $self->{debug};
          my $nbytes = sysread( $task->{handle}, $task->{read_buffer}, 65536, length ($task->{read_buffer}));
+         print STDERR "IO::Events: # $i read $nbytes bytes\n" if $self->{debug};
 	 unless ( defined $nbytes) {
 	    $self-> error( $task, 'read') unless $! == EAGAIN;
 	    next;
@@ -82,13 +84,13 @@ sub yield
       } 
 
       if ( $w) {
-         print STDERR "IO::Events: write $i\n" if $self->{debug};
          unless ( length $task->{write_buffer}) {
 	    vec( $self->{write}, $task-> {fileno}, 1) = 0;
 	    $task-> notify('on_write');
 	    next;
 	 }
          my $nbytes = syswrite( $task->{handle}, $task->{write_buffer});
+         print STDERR "IO::Events: # $i wrote $nbytes bytes\n" if $self->{debug};
 	 unless ( defined $nbytes) {
 	    $self-> error( $task, 'write') unless $! == EAGAIN;
 	    next;
@@ -110,15 +112,38 @@ sub yield
    }
   
    # close processes
+WAITPID:   
    if ( $self-> {waitpid}) {
       while (($_ = waitpid(-1,WNOHANG)) > 0) {
-	  next unless $self->{processes}->{$_};
-	  my $task = $self-> {ids}-> {$self->{processes}-> {$_}};
-	  $task->{exitcode} = $?;
-	  $task->{finished} = 1;
-	  $task-> destroy;
+	 next unless $self->{processes}->{$_};
+	 my $task = $self-> {ids}-> {$self->{processes}-> {$_}};
+	 # read leftovers
+	 if ( $task-> can_read) {
+	    my $notify;
+	    while ( 1) {
+	       my $nbytes = sysread( $task->{handle}, $task->{read_buffer}, 65536, length ($task->{read_buffer}));
+	       unless ( defined $nbytes) {
+		  $self-> error( $task, 'read') unless $! == EAGAIN;
+		  last;
+	       }
+	       $notify += $nbytes;
+	       last unless $nbytes;
+	    }
+            $task-> notify('on_read') if $notify;
+	 }
+	 # XXX if $task-> can_exception ... read URG bytes?
+	 $task->{exitcode} = $?;
+	 $task->{finished} = 1;
+	 $task-> destroy;
       }
    }
+
+   return $n;
+}
+
+sub handles
+{
+   return scalar(keys %{$_[0]->{ids}});
 }
 
 sub flush
@@ -132,12 +157,33 @@ sub error
    $task-> notify('on_error', $condition, $!) if $task;
 }
 
+sub on_fork
+{
+   $IO::Events::FORK_MODE = 1;
+   shift-> DESTROY;
+   $IO::Events::FORK_MODE = undef;
+}
+
 sub DESTROY
 {
-   for ( values %{$_[0]->{ids}}) {
+   my $self = $_[0];
+   return if $self->{dead};
+   for ( values %{$self->{ids}}) {
       next unless $_;
+      $_->{dead} = 1 if $IO::Events::FORK_MODE;
       $_-> destroy;
    }
+   @IO::Events::loops = grep { $self != $_ } @IO::Event::IPC::loops;
+   $self-> {dead} = 1;
+}
+
+END
+{
+   for ( @IO::Events::loops) {
+      eval { $_->DESTROY };
+      warn "$@" if $@;
+   }
+   @IO::Events::loops = ();
 }
 
 # Single task
@@ -185,7 +231,7 @@ sub new
    my $fno = fileno( $self->{handle});
    die "Cannot read fileno() from handle" unless defined $fno;
    $self-> {fileno} = $fno;
-   if ( $self-> {nonblock}) {
+   unless ( $self-> {nonblock}) {
       my $fl = 0;
       fcntl( $self->{handle}, F_GETFL, $fl) or die "$!";
       fcntl( $self->{handle}, F_SETFL, $fl|O_NONBLOCK) or die "$!";
@@ -252,7 +298,7 @@ sub DESTROY
 
 sub readline
 {
-   return $1 if $_[0]-> {read_buffer} =~ s/^([^\n]+\n)//;
+   return $1 if $_[0]-> {read_buffer} =~ s/^([^\n]*\n)//;
    return undef;
 }
 
@@ -267,14 +313,14 @@ sub write
 {
    my ( $self, $data) = @_;
    $self-> {write_buffer} .= $data;
-   vec( $self->{owner}->{write}, $self-> {fileno}, 1) = 1;
+   vec( $self->{owner}->{write}, $self-> {fileno}, 1) = 1 if $self->{owner};
 
    my $nbytes = syswrite( $self->{handle}, $self->{write_buffer});
    unless ( defined $nbytes) {
-      $self-> {owner}-> error( $self, 'write') unless $! == EAGAIN;
+      $self-> {owner}-> error( $self, 'write') if $self->{owner} && $! != EAGAIN;
    } elsif ( $nbytes > 0) {
       substr( $self->{write_buffer}, 0, $nbytes) = '';
-   }
+  }
 }
 
 sub destroy { shift-> DESTROY }
@@ -346,38 +392,61 @@ sub new
    return $self;
 }
 
-package IO::Events::internal::Fork;
-use vars qw(%events);
-
-$events{on_fork} = 1;
-
-sub _new
-{
-   my ( $self, %profile) = @_;
-   $self = $self-> SUPER::new( 
-      %profile,
-      process => '-',
-   );
-   if ( $self->{pid} == 0) {
-      $self-> notify('on_fork');
-      exit $self-> {exitcode};
-   }
-   return $self;
-}
-
 # internal reader process
 package IO::Events::Fork::Read;
 use vars qw(@ISA);
-@ISA = qw(IO::Events::Process::Read IO::Events::internal::Fork);
+@ISA = qw(IO::Events::Handle);
 
-sub new { shift-> _new( @_, read => 1 ) }
+sub new
+{
+   my ( $self, %profile) = @_;
+   my $handle = IO::Handle-> new();
+   $handle-> autoflush(1);
+   my $pid = open( $handle, "-|");
+   die("Cannot fork:$!") unless defined $pid;
+   unless ( $pid) {
+      # $profile{owner}->on_fork();
+      my $on_fork = $profile{on_fork} || $self->can('on_fork');
+      $on_fork->(\%profile) if $on_fork;
+      POSIX::_exit(0);
+   }
+
+   $self = $self-> SUPER::new( 
+      read => 1, 
+      %profile, 
+      handle => $handle,
+      pid    => $pid,
+   );
+   return $self;
+}
 
 # internal writer process
 package IO::Events::Fork::Write;
 use vars qw(@ISA);
-@ISA = qw(IO::Events::Process::Write IO::Events::internal::Fork);
+@ISA = qw(IO::Events::Handle);
 
-sub new { shift-> _new( @_, write => 1 ) }
+sub new
+{
+   my ( $self, %profile) = @_;
+   my $handle = IO::Handle-> new();
+   $handle-> autoflush(1);
+   my $pid = open( $handle, "|-");
+   die("Cannot fork:$!") unless defined $pid;
+   unless ( $pid) {
+      # $profile{owner}->on_fork();
+      my $on_fork = $profile{on_fork} || $self->can('on_fork');
+      $on_fork->(\%profile) if $on_fork;
+      POSIX::_exit(0);
+   }
+
+   $self = $self-> SUPER::new( 
+      write => 1, 
+      %profile, 
+      handle => $handle,
+      pid    => $pid,
+   );
+   return $self;
+}
 
 package IO::Events::internal::Shadow;
 use vars qw(@ISA);
@@ -388,29 +457,19 @@ sub new
    my ( $self, %profile) = @_;
    $profile{shadow_task} = $profile{owner}->{ids}->{$profile{id}};
    $profile{id} = "shadow:$profile{id}";
-   return $self-> SUPER::new(%profile);
+   my $ret = $self-> SUPER::new(%profile);
+   return $ret;
 }
 
-sub DESTROY
+sub on_close
 {
    undef $_[0]->{shadow_task}-> {shadow};
-   $_[0]->SUPER::DESTROY;
 }
-
-package IO::Events::internal::ShadowMaster;
-
-sub DESTROY
-{
-   $_[0]->{shadow}->DESTROY if $_[0]->{shadow};
-   $_[0]->SUPER::DESTROY;
-}
-
-sub write { shift-> {shadow}-> write( @_) }
 
 # internal bidirectional process
 package IO::Events::Fork::ReadWrite;
 use vars qw(@ISA);
-@ISA = qw(IO::Events::Handle IO::Events::internal::ShadowMaster);
+@ISA = qw(IO::Events::Handle);
 
 sub new
 {
@@ -428,16 +487,20 @@ sub new
    pipe(READER, $handle2);
    pipe($handle1, WRITER);
    WRITER->autoflush(1);
-
+      
    my $pid = fork();
    die("Cannot fork:$!") unless defined $pid;
    
    unless ( $pid) {
+      close $handle1;
+      close $handle2;
       open STDOUT, ">&WRITER";
-      open STDIN,  ">&READER";
+      open STDIN,  "<&READER";
+
+      # $profile{owner}->on_fork();
       my $on_fork = $profile{on_fork} || $self->can('on_fork');
       $on_fork->(\%profile) if $on_fork;
-      exit;
+      POSIX::_exit(0);
    } 
 
    close WRITER;   
@@ -474,13 +537,37 @@ sub shadow_close
    shift-> {shadow_task}-> notify('on_close', 1);
 }
 
-sub DESTROY
+sub shutdown
 {
-   $_[0]->{shadow}->DESTROY if $_[0]->{shadow};
-   $_[0]->SUPER::DESTROY;
+   my ( $self, @cmd) = @_;
+   my $pid = $self-> {pid};
+   my $owner = $self-> {owner};
+   my $entry;
+   for ( @cmd) {
+      if ( $_ eq 'read') {
+	 $entry = $self-> {shadow}-> {id};
+         $self-> SUPER::DESTROY;
+      } elsif ( $_ eq 'write') {
+	 $entry = $self-> {id};
+         $self-> {shadow}-> DESTROY if $self-> {shadow};
+      }
+   }
+   $owner-> {processes}-> {$pid} = $entry if defined $entry;
 }
 
-sub write { shift-> {shadow}-> write( @_) }
+sub DESTROY
+{
+   return if $_[0]->{dead};
+   $_[0]->{shadow}->DESTROY if $_[0]->{shadow};
+   $_[0]->SUPER::DESTROY;
+   $_[0]->{dead} = 1;
+}
+
+sub write { 
+   my $self = shift;
+   return unless $self->{shadow};
+   $self-> {shadow}-> write( @_) 
+}
 
 # external bidirectional process
 package IO::Events::Process::ReadWrite;
@@ -489,7 +576,7 @@ use vars qw(@ISA);
 
 sub on_fork
 {
-   exec( $_[0]->{process}) or die "Cannot exec $_[0]->{process}:$!";
+   exec( $_[0]->{process}) or POSIX::_exit(0);
 }
 
 package IO::Events::stdin;
@@ -534,6 +621,41 @@ sub new
    return $self-> SUPER::new(%profile);
 }
 
+package IO::Events::Socket::TCP;
+use vars qw(@ISA);
+@ISA=qw(IO::Events::Handle);
+
+use Socket;
+use Fcntl;
+use Errno qw(EWOULDBLOCK EINPROGRESS);
+
+my $tcp_protocol = getprotobyname('tcp');
+
+sub new
+{
+   my ( $self, %profile) = @_;
+
+   $profile{handle} = IO::Handle-> new unless $profile{handle};
+   die "Cannot create socket: $!\n" unless 
+      socket( $profile{handle}, PF_INET, SOCK_STREAM, $tcp_protocol);
+   unless ( $profile{nonblock}) {
+      my $fl = 0;
+      fcntl( $profile{handle}, F_GETFL, $fl) or die "$!";
+      fcntl( $profile{handle}, F_SETFL, $fl|O_NONBLOCK) or die "$!";
+   }
+
+   if ( $profile{connect}) {
+      my $iaddr;
+      die "Cannot resolve host\n" unless
+         $iaddr = inet_aton( $profile{host});
+      my $ok = connect( $profile{handle}, sockaddr_in( $profile{port}, $iaddr));
+      $ok = 1 if !$ok and ( $! == EWOULDBLOCK || $! == EINPROGRESS);
+      die "Connect error: $!" unless $ok;
+   }
+   
+   return $self-> SUPER::new(%profile);
+}
+
 1;
 
 __DATA__
@@ -542,18 +664,11 @@ __DATA__
 
 =head1 NAME
 
-IO::Events - Asynchronous IPC IO events object framework.
-
-=head1 WHY YET ANOTHER MODULE?
-
-If all you need is to run a couple of co-processes, you don't really need
-a sophisticated module, a simple select()/open(|) wrapper will do. This
-module doesn't try to take it all, contains no C code, has no dependencies,
-and is not thought to be Ze One True Event Loop. Plus, TMTOWTDI.
+IO::Events - Events for non-blocking IPC via pipes
 
 =head1 SYNOPSIS
 
-   # run calculator as a co-process
+   # run 'bc' as a co-process
    use IO::Events;
 
    my $loop = IO::Events::Loop-> new();
@@ -609,6 +724,7 @@ C<IPC::Open>, and can perfectly live together with the first and counteract
 with the handles managed by the second. The example in L<"SYNOPSIS"> section
 displays how to harness the non-blocking IO between stdin and a co-process.
 
+
 =head1 IO::Events::Loop
 
 =head2 C<new()> parameters
@@ -635,6 +751,12 @@ Default value: 1
 
 =over
 
+=item handles
+
+Returns number of handles owner by loop object. When a program
+automatically disposes of handles, not needed anymore, it may choose
+to stop when there are no more handles to serve.
+
 =item yield %HASH
 
 Enters C<select()> loop and dispatches pending IO if data are available to read
@@ -645,6 +767,8 @@ Practically,
    $loop-> yield( block_read => 1, block_exc => 1, timeout => 0 )
 
 call effectively ( but still in the non-blocking fashion ) flushes write buffers.
+
+Returns result of select() call, the number of streams handled.
 
 =item flush
 
@@ -705,6 +829,12 @@ Set to 1 if C<handle> is to be read from.
 
 Default value: 0
 
+=item shutdown @WHO
+
+Defined in C<IO::Events::Fork::ReadWrite> and C<IO::Event::IPC::Process::ReadWrite>
+namespaces. @WHO can contain string C<'read'> and C<'write'>, to tell what
+part of bidirectional IPC is to be closed.
+
 =item write BOOLEAN
 
 Set to 1 if C<handle> is to be written from.
@@ -758,7 +888,7 @@ Dispatches EVENT, passing PARAMETERS to each callback.
 
 =back
 
-=head2 Eventss
+=head2 Events
 
 A single event can cause several callback routines to be called. This is useful
 when a class declares its own, for example, cleanup code in C<on_close> sub,
@@ -786,6 +916,10 @@ to stderr and destroys the handle.
 
 Called before object instance is destroyed. 
 
+In a special case for ReadWrite objects, C<on_close> can be called twice,
+when either read or write handles are destroyed. In the latter case the
+second parameter is set to 1.
+
 Declared as MULTIPLE.
 
 =item on_create
@@ -804,6 +938,18 @@ Declared as MULTIPLE.
 
 Called when exception is arrived. Consult your system C<select> manpage
 to see what events and on what socket types can be expected.
+
+=item on_fork
+
+Special event, called by C<IO::Events::Fork> objects when 
+a new process is instantiated. Although the syntax for specifying 
+C<on_fork> is the same as for the other events, C<on_fork> does
+not interact with these, and is not called from within C<yield>.
+
+When C<on_fork> returned, process is terminated. If you wish to
+terminate process yourself, do not call perl's C<exit> but rather
+C<POSIX::_exit>, since otherwise perl stuctures created before fork
+will be destroyed twice.
 
 =item on_read
 
@@ -861,13 +1007,7 @@ Shortcut class for STDERR handle.
 
 =head1 SEE ALSO
 
-L<perlipc>, L<IO::Handle>, L<IO::Select>, L<IPC::Open2>, L<Event>,
-L<POE>, L<IO::Event>.
-
-=head1 BUGS
-
-Processes don't work on platforms where children processes are automatically reaped (
-no waitpid ); win32 is one of these.
+L<perlipc>, L<IO::Handle>, L<IO::Select>, L<IPC::Open2>.
 
 =head1 COPYRIGHT
 

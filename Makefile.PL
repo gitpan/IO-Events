@@ -8,6 +8,6 @@ WriteMakefile(
 		     },
 
     'DISTNAME' => 'IO-Events',
-    'ABSTRACT' => 'Asynchronous IPC IO events object framework',
+    'ABSTRACT' => 'Events for non-blocking IPC via pipes',
     'AUTHOR'   => 'Dmitry Karasik <dmitry@karasik.eu.org>',
 );
