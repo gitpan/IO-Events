@@ -24,13 +24,12 @@
 #  SUCH DAMAGE.
 #
 
-# $Id: Events.pm,v 1.23 2005/04/19 08:15:55 dk Exp $
-
+# $Id: Events.pm,v 1.32 2007/03/28 08:01:59 dk Exp $
 use strict;
 
 package IO::Events;
 use vars qw($VERSION $FORK_MODE @loops);
-$VERSION=0.5;
+$VERSION=0.6;
 
 # Master loop object
 package IO::Events::Loop;
@@ -39,6 +38,7 @@ use vars qw(@ISA);
 use IO::Handle;
 use Errno qw(EAGAIN);
 use POSIX qw(sys_wait_h exit);
+use Time::HiRes qw(time);
 
 sub new
 {
@@ -57,6 +57,7 @@ sub new
 		processes => {},
 		filenos   => {},
 		ids       => {},
+		timers    => [],
 	}, $class;
 	push @IO::Events::loops, $obj;
 	return $obj;
@@ -67,12 +68,31 @@ sub yield
 	my ( $self, %profile) = @_;
 
 	my ( $ir, $iw, $ie) = ( 
-		$profile{block_read}  ? '' : $self->{read}, 
-		$profile{block_write} ? '' : $self-> {write},
-		$profile{block_exc}   ? '' : $self-> {exc},
+		$self->{read}, 
+		$profile{block_write} ? '' : $self-> {write}, 
+		$profile{block_exc} ? '' : $self-> {exc}
 	);
-	my $n = select( $ir, $iw, $ie, 
-		exists $profile{timeout} ? $profile{timeout} : $self->{timeout});
+
+	my $timeout = exists $profile{timeout} ? $profile{timeout} : $self->{timeout};
+	if ( @{$self->{timers}}) {
+		my $time = time;
+		for my $timer (@{$self->{timers}}) {
+			next unless $timer->{active};
+			my $sleep = $timer->{alert} - $time;
+			$timeout = $sleep if $timeout > $sleep;
+		}
+		$timeout = 0 if $timeout < 0;
+	}
+	my $n = select( $ir, $iw, $ie, $timeout);
+
+	if ( @{$self->{timers}}) {
+		my $time = time;
+		for my $timer (@{$self->{timers}}) {
+			next if not $timer->{active} or $time < $timer->{alert};
+			$timer-> notify;
+		}
+	}
+	
 	unless ( $n > 0) {
 		if ( $self->{debug}) {
 			print STDERR "IO::Events: empty select";
@@ -99,9 +119,16 @@ sub yield
 			$self-> error( undef, 'select');
 			next;
 		}
-		if ( $r) {
-			my $nbytes = sysread( $task->{handle}, $task->{read_buffer}, 
-				65536, length ($task->{read_buffer}));
+		if ( $task-> {callback} and not $task-> {dead} ) {
+			$task-> {callback}-> ( $task, $r, $w, $e);
+		}
+
+		if ( $r and not $task-> {dead}) {
+			my $nbytes;
+			if ( $task-> {read} > -1) {
+				$nbytes = sysread( $task->{handle}, $task->{read_buffer}, 
+					$profile{block_read} ? 0 : 65536, length ($task->{read_buffer}));
+			}
 			if ( $task->{read} > 0) {
 				print STDERR "IO::Events: # $i read $nbytes bytes\n" 
 					if $self->{debug};
@@ -114,6 +141,7 @@ sub yield
 				print STDERR "IO::Events: # $i simulated read $nbytes\n" 
 					if $self->{debug};
 			}
+			next if $profile{block_read};
 			if ( $nbytes > 0) {
 				$task-> notify('on_read');
 				next;
@@ -218,6 +246,10 @@ sub DESTROY
 		next unless $_;
 		$_->{dead} = 1 if $IO::Events::FORK_MODE;
 		$_-> destroy;
+	}
+	for ( @{$self->{timers}}) {
+		next unless $_;
+		$_->{dead} = 1;
 	}
 	@IO::Events::loops = grep { $self != $_ } @IO::Event::IPC::loops;
 	$self-> {dead} = 1;
@@ -705,6 +737,8 @@ package IO::Events::Socket;
 use vars qw(@ISA);
 @ISA=qw(IO::Events::Handle);
 
+use Socket;
+
 sub accept
 {
 	my ( $self, %profile) = @_;
@@ -717,15 +751,30 @@ sub accept
 	);
 }
 
+sub connect
+{
+	$_[0]-> {callback} = \&socket_connect_error_checker;
+}
+
+sub socket_connect_error_checker
+{
+	my ( $self, $r, $w, $e) = @_;
+	delete $self-> {callback};
+
+	local $! = unpack('i', getsockopt($self-> {handle}, SOL_SOCKET, SO_ERROR)); 
+	if ( $!) {
+		$self-> {owner}-> error( $self, 'connect') if $self->{owner};
+	}
+}
+
 package IO::Events::Socket::TCP;
 use vars qw(@ISA);
 @ISA=qw(IO::Events::Socket);
 
+use strict;
 use Socket;
 use Fcntl;
 use Errno qw(EWOULDBLOCK EINPROGRESS);
-
-my $tcp_protocol = getprotobyname('tcp');
 
 sub new
 {
@@ -733,7 +782,7 @@ sub new
 
 	$profile{handle} = IO::Handle-> new unless $profile{handle};
 	die "Cannot create socket: $!" unless 
-		socket( $profile{handle}, PF_INET, SOCK_STREAM, $tcp_protocol);
+		socket( $profile{handle}, PF_INET, SOCK_STREAM, getprotobyname('tcp'));
 
 	unless ( $profile{nonblock}) {
 		my $fl;
@@ -752,13 +801,114 @@ sub new
 	} elsif ( exists $profile{listen}) {
 		setsockopt( $profile{handle}, SOL_SOCKET, SO_REUSEADDR, pack("l", 1)) or 
 			die "Error in setsockopt(SOL_SOCKET,SO_REUSEADDR,1):$!";
-		bind( $profile{handle}, sockaddr_in( $profile{port}, INADDR_ANY)) or
-			die "Error in bind($profile{port}, INADDR_ANY):$!";
+		my $addr = $profile{addr} || '0.0.0.0';
+		my $inet = inet_aton( $addr);
+		die "Cannot resolve host '$addr'" unless defined $inet;
+		bind( $profile{handle}, sockaddr_in( $profile{port}, $inet)) or
+			die "Error in bind($profile{port}, $addr):$!";
 		listen( $profile{handle}, SOMAXCONN);
 		$profile{read} = -1;
 	}
 
+	my $this = $self-> SUPER::new(%profile);
+	$this-> SUPER::connect() if $profile{connect};
+	return $this;
+}
+
+sub accept
+{
+	my ( $self, %profile) = @_;
+	my $client = $self-> SUPER::accept( %profile);
+	my ($port, $ipaddr) = unpack_sockaddr_in( getpeername( $client->{handle}));
+	$client-> {remote_addr} = inet_ntoa($ipaddr);
+	$client-> {remote_port} = $port;
+	return $client;
+}
+
+package IO::Events::Socket::UDP;
+use vars qw(@ISA);
+@ISA=qw(IO::Events::Socket);
+
+use strict;
+use Socket;
+use Fcntl;
+
+sub new
+{
+	my ( $self, %profile) = @_;
+
+	$profile{handle} = IO::Handle-> new unless $profile{handle};
+	die "Cannot create socket: $!" unless 
+		socket( $profile{handle}, PF_INET, SOCK_DGRAM, getprotobyname('udp'));
+
+	unless ( $profile{nonblock}) {
+		my $fl;
+		$fl = fcntl( $profile{handle}, F_GETFL, 0);
+		die "$!" unless defined $fl;
+		fcntl( $profile{handle}, F_SETFL, $fl|O_NONBLOCK) or die "$!";
+	}
+		
+	my $addr = $profile{addr} || '0.0.0.0';
+	my $inet = inet_aton( $addr);
+	die "Cannot resolve host '$addr'" unless defined $inet;
+		
+	if ( $profile{broadcast}) {
+		setsockopt( $profile{handle}, SOL_SOCKET, SO_BROADCAST, pack("l", 1)) or 
+			die "Error in setsockopt(SOL_SOCKET,SO_BROADCAST,1):$!";
+	}
+	$profile{read} = -2;
+	
+	bind( $profile{handle}, sockaddr_in( $profile{port} || 0, $inet)) or
+		die "Error in bind($profile{port}, $addr):$!";
+
 	return $self-> SUPER::new(%profile);
+}
+
+sub recv
+{
+	my ( $self, %profile) = @_;
+
+	$profile{maxlen} = 32768 unless defined $profile{maxlen};
+
+	my $flags = MSG_DONTWAIT;
+	$flags |= MSG_OOB if $profile{oob};
+	$flags |= MSG_PEEK if $profile{peek};
+	$flags |= MSG_WAITALL if $profile{waitall};
+	$flags &= ~MSG_DONTWAIT if defined($profile{nonblock}) and $profile{nonblock} == 0;
+	
+	my ( $port, $host);
+	my $data = '';
+	$host = recv( $self-> {handle}, $data, $profile{maxlen}, $flags);
+	unless ( defined $host) {
+		$self-> error( 'recv');
+		return undef;
+	}
+	( $port, $host) = sockaddr_in( $host);
+	$self-> {remote_port} = $port;
+	$self-> {remote_host} = gethostbyaddr( $host, AF_INET);
+
+	return $data;
+}
+
+sub send
+{
+	my ( $self, $addr, $port, $data, %profile) = @_;
+
+	my $flags = 0;
+	$flags |= MSG_OOB if $profile{oob};
+	$flags |= MSG_DONTROUTE if $profile{dontroute};
+	$flags |= MSG_EOR if $profile{eor};
+	$flags |= MSG_EOF if $profile{eof};
+	
+	my $inet = inet_aton($addr) || die "unknown host '$addr'\n";
+	$inet = sockaddr_in( $port, $inet);
+
+	my $ret = send( $self-> {handle}, $data, $flags, $inet);
+	unless ( defined $ret) {
+		$self-> error( 'recv');
+		return undef;
+	}
+	return $ret;
 }
 
 package IO::Events::Socket::UNIX;
@@ -785,7 +935,7 @@ sub new
 
 	if ( defined $profile{connect}) {
 		connect( $profile{handle}, pack_sockaddr_un($profile{connect})) or
-					die "connect($profile{connect}) error: $!";
+			die "connect($profile{connect}) error: $!";
 	} elsif ( exists $profile{listen}) {
 		bind( $profile{handle}, pack_sockaddr_un($profile{listen})) or 
 			die "Error in bind($profile{listen}):$!";
@@ -793,8 +943,79 @@ sub new
 		$profile{read} = -1;
 	}
 
-	return $self-> SUPER::new(%profile);
+	my $this = $self-> SUPER::new(%profile);
+	$this-> SUPER::connect() if $profile{connect};
+	return $this;
 }
+
+package IO::Events::Timer;
+use Time::HiRes qw(time);
+
+sub new
+{
+	my $class = shift;
+
+	my $self = bless {
+		timeout		=> 10000,
+		repetitive	=> 0,
+		active		=> 0,
+		@_,
+	}, $class;
+	
+	for ( qw(owner)) {
+		die "No `$_' field" unless defined $self-> {$_};
+	}
+
+	push @{$self-> {owner}-> {timers}}, $self;
+
+	$self-> start if $self-> {active};
+
+	return $self;
+}
+
+sub DESTROY
+{
+	my $self = $_[0];
+	return if $self-> {dead};
+	@{$self-> {owner}-> {timers}} = grep { $_ != $self } @{$self-> {owner}-> {timers}};
+}
+
+sub start
+{
+	my $self = $_[0];
+	$self-> {alert} = time + $self-> {timeout};
+	$self-> {active} = 1;
+}
+
+sub stop { $_[0]-> {active} = 0 }
+
+sub active 
+{
+	my ( $self, $active) = @_;
+	return if $active == $self-> {active}; # to avoid restarts
+	$active ? $self-> start : $self-> stop;
+}
+
+sub notify
+{
+	my $self = $_[0];
+
+	if ( $self-> {repetitive}) {
+		my $time = time;
+		# eat up late events
+		$self-> {alert} += $self-> {timeout} while $self-> {alert} < $time;
+	} else {
+		$self-> {active} = 0;
+	}
+	
+	$self-> {event_flag} = 0;
+	if ( defined $self->{on_tick}) {
+		$self->{on_tick}->($self);
+		return if $self->{event_flag};
+	}
+	$self-> on_tick() if $self-> can('on_tick');
+}
+
 
 1;
 
@@ -804,11 +1025,12 @@ __DATA__
 
 =head1 NAME
 
-IO::Events - Events for non-blocking IPC via pipes
+IO::Events - Non-blocking IO using events 
 
 =head1 SYNOPSIS
 
-	# run 'bc' as a co-process
+Example 1, run 'bc' as a co-process:
+
 	use IO::Events;
 
 	my $loop = IO::Events::Loop-> new();
@@ -839,6 +1061,61 @@ IO::Events - Events for non-blocking IPC via pipes
 	);
 
 	$loop-> yield while 1;
+
+
+Example 2, connect to/listen on a TCP port within a single process:
+
+	use IO::Events;
+	
+	my $loop = IO::Events::Loop-> new();
+	IO::Events::Socket::TCP-> new(
+		owner    => $loop,
+		listen   => 1,
+		port     => 10000,
+		on_read => sub {
+			my $new = shift-> accept( 
+				read   => 1,
+				on_read => sub {
+					while ( my $line = $_[0]-> readline) {
+						print "client says: $line\n";
+						exit;
+					}
+				}
+			);
+	                print "connect from $new->{remote_addr}:$new->{remote_port}\n";
+		},
+	);
+	
+	IO::Events::Socket::TCP-> new(
+		owner   => $loop,
+		connect => 'localhost',
+		port 	=> 10000,
+	)-> write("hello, tcp socket!\n");
+	
+	$loop->yield while 1;
+
+Example 3, connect to/listen on a UDP port within a single process:
+
+	use Socket;
+	use IO::Events;
+	
+	my $loop = IO::Events::Loop-> new();
+	IO::Events::Socket::UDP-> new(
+		owner    => $loop,
+		port     => 10000,
+		on_read => sub {
+			my $self = $_[0];
+			my $data = $self-> recv;
+			print "$self->{remote_host}:$self->{remote_port} says: $data";
+			exit;
+		},
+	);
+	
+	IO::Events::Socket::UDP-> new(
+		owner   => $loop,
+	)-> send( 'localhost', 10000, "hello, udp socket!\n");
+	
+	$loop->yield while 1;
 
 =head1 DESCRIPTION
 
@@ -1190,11 +1467,45 @@ If set, socket listens on C<port>.
 
 Number of a port to bind to.
 
+=item addr STRING
+
+If set, socket listens on C<addr> IP address, otherwise INADDR_ANY.
+
 =item accept %PROFILE
 
 Creates a new IO handle and accepts a connection into it.
 Returns the newly created C<IO::Events::Handle> object 
 with C<%PROFILE> fields.
+
+=back
+
+=head1 IO::Events::Socket::UDP
+
+Shortcut class for UDP socket. Parameters accepted:
+
+=over
+
+=item port INTEGER
+
+Number of a port to bind to.
+
+=item addr STRING
+
+If set, socket listens on C<addr> IP address, otherwise INADDR_ANY.
+
+=item send HOSTNAME, PORT, DATA, %OPTIONS
+
+Issues send(2) call, returns number of bytes sent or an error.
+See L<perldoc/send> for more details.
+
+Options accepted: C<oob>, C<dontroute>, C<eor>, C<eof>.
+
+=item recv %OPTIONS
+
+Issues recv(2) call, returns data block or under if error. 
+See L<perldoc/recv> for more details.
+
+Options accepted: C<oob>, C<peek>, C<waitall>, C<nonblock>, C<maxlen>.
 
 =back
 
@@ -1210,7 +1521,6 @@ Creates a new IO handle and accepts a connection into it.
 Returns the newly created C<IO::Events::Handle> object 
 with C<%PROFILE> fields.
 
-
 =item connect PATHNAME
 
 Connects to a socket over a given PATHNAME
@@ -1219,15 +1529,46 @@ Connects to a socket over a given PATHNAME
 
 Listens on a socket over a given PATHNAME
 
-=item accept GENERIC
+=back
 
-Accepts connection from GENERIC socket.
+=head1 IO::Events::Timer
+
+A tiny hackish hask to add time-based events. The class is not inherited
+from C<IO::Event::Handle>, and the only property it shared with the other
+handle classes is C<owner>. 
+
+=over
+
+=item timeout SECONDS
+
+Invokes C<on_tick> callback in SECONDS, which can be float.
+
+=item active BOOLEAN
+
+If on, timer is started immediately, otherwise is stopped.
+
+=item repetitive BOOLEAN
+
+If on, timer fires off event each SECONDS interval, otherwise goes off
+after the first C<on_tick>.
+
+=item start
+
+Starts the timer
+
+=item stop
+
+Stops the timer
+
+=item on_tick
+
+Callback invoked each time SECONDS interval is expired.
 
 =back
 
 =head1 SEE ALSO
 
-L<perlipc>, L<IO::Handle>, L<IO::Select>, L<IPC::Open2>.
+L<perlipc>, L<POE>, L<IO::Handle>, L<IO::Select>, L<IPC::Open2>.
 
 =head1 COPYRIGHT
 

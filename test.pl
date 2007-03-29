@@ -1,10 +1,12 @@
 my $loaded;
-BEGIN { $| = 1; print "1..4\n"; }
+BEGIN { $| = 1; print "1..6\n"; }
 END {print "not ok 1\n" unless $loaded;}
 use IO::Events;
 use strict;
 $loaded = 1;
 print "ok 1\n";
+
+my $port = (defined ($ENV{TESTPORT}) ? $ENV{TESTPORT} : 29876);
 
 my $run = 1;
 my $loop = IO::Events::Loop-> new();
@@ -41,7 +43,8 @@ loopy(2);
 IO::Events::Socket::TCP-> new(
 	owner    => $loop,
 	listen   => 1,
-	port     => 10000,
+	addr     => '127.0.0.1',
+	port     => $port,
 	on_read => sub {
 		shift-> accept( 
 			read   => 1,
@@ -56,8 +59,8 @@ IO::Events::Socket::TCP-> new(
 
 IO::Events::Socket::TCP-> new(
 	owner   => $loop,
-	connect => 'localhost',
-	port 	=> 10000,
+	connect => '127.0.0.1',
+	port 	=> $port,
 )-> write("hello, tcp socket!\n");
 
 loopy(3);
@@ -86,4 +89,28 @@ IO::Events::Socket::UNIX-> new(
 
 loopy(4);
 
+# test UDP communication
+IO::Events::Socket::UDP-> new(
+	owner    => $loop,
+	port     => $port,
+	on_read => sub {
+		shift-> recv;
+		$run = 0;
+	},
+);
+
+IO::Events::Socket::UDP-> new(
+	owner   => $loop,
+)-> send( 'localhost', $port, "hello, udp socket!\n");
+
+loopy(5);
 unlink './unix-socket';
+
+# test timer
+IO::Events::Timer-> new(
+	owner   => $loop,
+	active  => 1,
+	timeout => 0.01,
+	on_tick => sub { $run = 0 }
+);
+loopy(6);

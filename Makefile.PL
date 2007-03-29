@@ -8,6 +8,9 @@ WriteMakefile(
 		     },
 
     'DISTNAME' => 'IO-Events',
-    'ABSTRACT' => 'Events for non-blocking IPC via pipes',
+    'ABSTRACT' => 'Events for non-blocking IPC',
     'AUTHOR'   => 'Dmitry Karasik <dmitry@karasik.eu.org>',
+    'PREREQ_PM'   => {
+        'Time::HiRes' => '0',
+    },
 );
